@@ -144,44 +144,175 @@ def new_session(name: str = "isnet-general-use", progress=None) -> Segmenter:
     return Segmenter(name, progress)
 
 
-def make_mask(img: Image.Image, session: Segmenter, raw: np.ndarray | None = None) -> Image.Image:
-    """商品部分=255, 背景=0 のマスクを返す"""
-    from scipy import ndimage
-    m = np.asarray(session.predict(img, raw))
-    # 境界をなめらかにして2値化（小さなノイズも除去）
-    cross = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], bool)
-    m = ndimage.grey_opening(m, footprint=cross)
-    m = ndimage.gaussian_filter(m.astype(np.float32), sigma=2)
-    m = np.where(m < 127, 0, 255).astype(np.uint8)
-    alpha = Image.fromarray(m).filter(ImageFilter.MedianFilter(3))
-    return alpha
+WORK_SIDE = 1600  # 切り抜きの計算はこの大きさで行い、最後になめらかに拡大する
 
 
-def refine_gaps(img: Image.Image, mask: Image.Image) -> Image.Image:
-    """パンツの股下や袖と胴のすき間など、AIが商品扱いした「背景色の部分」を消す。
-    背景とつながっていて、背景とほぼ同じ色の領域だけを対象にする。"""
+def _disk(r: int) -> np.ndarray:
+    y, x = np.ogrid[-r:r + 1, -r:r + 1]
+    return x * x + y * y <= r * r
+
+
+def make_mask(img: Image.Image, session: Segmenter, raw: np.ndarray | None = None,
+              refine: bool = True) -> Image.Image:
+    """商品部分=255, 背景=0 のマスク（ふちは なめらか）を元の写真サイズで返す"""
     from scipy import ndimage
-    arr = np.asarray(img, dtype=np.float32)
-    m = np.asarray(mask)
-    outside = m < 10
-    if outside.sum() < 1000:
-        return mask
+    work = img if max(img.size) <= WORK_SIDE else img.resize(_fit(img.size, WORK_SIDE), Image.LANCZOS)
+    soft = np.asarray(session.predict(work, raw)).astype(np.float32)
+    soft = ndimage.gaussian_filter(soft, sigma=1.0)
+    # AIが確信している部分＋それにつながる「半分くらい自信がある部分」（タグ・ラベル等）
+    sure = soft >= 127
+    maybe = soft >= 55
+    lab, _ = ndimage.label(maybe)
+    ids = np.unique(lab[sure])
+    hard = np.isin(lab, ids[ids > 0]) if sure.any() else sure
+    hard = clean_mask(hard)
+    if refine:
+        refined = refine_gaps(work, hard)
+        removed = hard & ~refined
+        if removed.any():
+            # すき間のまわり（影で少し暗い先端など）：すき間の色と服の色のどちらに近いかで判定
+            arr = ndimage.gaussian_filter(np.asarray(work, dtype=np.float32), sigma=(1.0, 1.0, 0))
+            r0 = max(2, round(max(hard.shape) * 0.003))
+            near = ndimage.binary_dilation(removed, structure=_disk(r0 * 4)) & refined
+            if near.any():
+                gap_col = np.median(arr[removed], axis=0)
+                fg_col = np.median(arr[near], axis=0)
+                if np.linalg.norm(gap_col - fg_col) > 25:  # 服と背景の色がはっきり違うときだけ
+                    d_gap = np.linalg.norm(arr - gap_col, axis=2)
+                    d_fg = np.linalg.norm(arr - fg_col, axis=2)
+                    extra = near & (d_gap < d_fg * 0.8)
+                    lab, _ = ndimage.label(extra | removed)
+                    ids = np.unique(lab[removed])
+                    extra &= np.isin(lab, ids[ids > 0])
+                    removed |= extra
+                    refined &= ~extra
+            # すき間を消したあと、ふちを軽く整える（消した背景は戻さない）
+            sm = ndimage.gaussian_filter(refined.astype(np.float32), sigma=max(1.0, max(hard.shape) * 0.001))
+            hard = (sm >= 0.5) & ~removed
+            # すき間の先端に残る細い糸のような背景も消す（すき間のまわりだけ）
+            r = max(2, round(max(hard.shape) * 0.003))
+            near = ndimage.binary_dilation(removed, structure=_disk(r * 3))
+            opened = ndimage.binary_opening(hard, structure=_disk(r))
+            hard = np.where(near, opened, hard)
+    if refine:
+        hard = edge_cleanup(work, hard)
+        hard = ndimage.binary_opening(hard, structure=_disk(1))
+    return upscale_mask(hard, img.size)
+
+
+def clean_mask(hard: np.ndarray) -> np.ndarray:
+    """ふちのギザギザ・点々のゴミ・小さな穴を取り除く（タグなど服につながった物は残す）"""
+    from scipy import ndimage
+    if not hard.any():
+        return hard
+    n = max(hard.shape)
+    # 1) 離れた小さなゴミを消す（いちばん大きい部分の0.3%未満）
+    lab, k = ndimage.label(hard)
+    if k > 1:
+        areas = ndimage.sum(hard, lab, index=np.arange(1, k + 1))
+        keep = np.flatnonzero(areas >= areas.max() * 0.003) + 1
+        hard = np.isin(lab, keep)
+    # 2) 服の中の小さな穴（点々）を埋める
+    holes = ndimage.binary_fill_holes(hard) & ~hard
+    lab, k = ndimage.label(holes)
+    if k:
+        areas = ndimage.sum(holes, lab, index=np.arange(1, k + 1))
+        small = np.flatnonzero(areas < hard.sum() * 0.003) + 1
+        hard = hard | np.isin(lab, small)
+    # 3) 輪郭をなめらかに（小さなトゲ・欠けをならす）
+    r = max(1, round(n * 0.0025))
+    hard = ndimage.binary_opening(hard, structure=_disk(r))
+    hard = ndimage.binary_closing(hard, structure=_disk(r))
+    # 4) さらに輪郭のガタつきをぼかして整える
+    sm = ndimage.gaussian_filter(hard.astype(np.float32), sigma=max(1.0, n * 0.0015))
+    return sm >= 0.5
+
+
+def upscale_mask(hard: np.ndarray, size) -> Image.Image:
+    """作業サイズのマスクを、元の写真サイズへなめらかに拡大（ふちは1〜2pxだけ柔らかく）"""
+    from scipy import ndimage
+    m = Image.fromarray(hard.astype(np.uint8) * 255).resize(size, Image.BILINEAR)
+    a = np.asarray(m).astype(np.float32)
+    scale = max(size) / max(hard.shape)
+    a = ndimage.gaussian_filter(a, sigma=max(0.6, scale * 0.5))
+    a = np.clip((a - 128) * 1.6 + 128, 0, 255)  # ふちの柔らかさは細く保つ
+    return Image.fromarray(a.astype(np.uint8))
+
+
+def edge_cleanup(img: Image.Image, hard: np.ndarray) -> np.ndarray:
+    """輪郭ぞいに残った「背景色の細い切れ端」（すき間の先端・ふちの影の帯など）を消す。
+    近くの背景の色と近くの服の色を比べ、背景に近い“細い”部分だけを消す（タグなど大きな物は残す）"""
+    from scipy import ndimage
+    n = max(hard.shape)
+    r = max(2, round(n * 0.003))
+    arr = ndimage.gaussian_filter(np.asarray(img, dtype=np.float32), sigma=(1.0, 1.0, 0))
+    out = ~hard
+    ring_in = hard & ndimage.binary_dilation(out, structure=_disk(r * 4))
+    if not ring_in.any() or out.sum() < 1000:
+        return hard
+    sig = n * 0.02
+
+    def local_mean(sel):
+        w = ndimage.gaussian_filter(sel.astype(np.float32), sig) + 1e-6
+        return np.stack([ndimage.gaussian_filter(arr[..., c] * sel, sig) / w for c in range(3)], -1)
+
+    bg_l = local_mean(out & ~ndimage.binary_dilation(hard, iterations=2))
+    fg_l = local_mean(hard & ~ring_in)
+    d_bg = np.linalg.norm(arr - bg_l, axis=2)
+    d_fg = np.linalg.norm(arr - fg_l, axis=2)
+    contrast = np.linalg.norm(bg_l - fg_l, axis=2)
+    cand = ring_in & (d_bg < d_fg * 0.7) & (contrast > 30)
+    # 細い部分だけ（太い塊＝タグ等は残す）
+    thin = cand & ~ndimage.binary_opening(cand, structure=_disk(r * 2))
+    # 外の背景とつながっているものだけ
+    lab, _ = ndimage.label(thin | out)
+    ids = np.unique(lab[out])
+    thin &= np.isin(lab, ids[ids > 0])
+    return hard & ~thin
+
+
+def refine_gaps(img: Image.Image, hard: np.ndarray) -> np.ndarray:
+    """パンツの股下や、袖と胴のすき間など「AIが商品扱いした背景」を消す。
+    ・背景とほぼ同じ色で、外の背景とつながっている部分だけが対象
+    ・消すのは「服にはさまれたすき間」か「ふちの細い帯（影など）」だけ。
+      タグのように外に張り出した物は、背景と同じ色でも消さない"""
+    from scipy import ndimage
+    arr = ndimage.gaussian_filter(np.asarray(img, dtype=np.float32), sigma=(1.5, 1.5, 0))
+    outside = ~ndimage.binary_dilation(hard, iterations=2)
+    if outside.sum() < 1000 or not hard.any():
+        return hard
     bg = np.median(arr[outside], axis=0)
     dist = np.linalg.norm(arr - bg, axis=2)
     thresh = max(14.0, float(np.percentile(dist[outside], 90)) * 1.3)
-    cand = dist < thresh
-    inside = m >= 128
-    # 商品自体が背景と似た色（白い服を白い床で撮った等）なら誤消去を避けて何もしない
-    if cand[inside].mean() > 0.25:
-        return mask
-    labels, _ = ndimage.label(cand)
-    bg_ids = np.unique(labels[outside & cand])
-    bg_ids = bg_ids[bg_ids > 0]
-    remove = np.isin(labels, bg_ids) & (m >= 10)
-    remove = ndimage.binary_opening(remove, iterations=1)  # 細かいノイズは消さない
-    out = m.copy()
-    out[remove] = 0
-    return Image.fromarray(out).filter(ImageFilter.MedianFilter(3))
+    cand = (dist < thresh) & hard
+    # 商品自体が背景と似た色（白い服を白い床で撮った等）なら何もしない
+    if cand.sum() > hard.sum() * 0.25:
+        return hard
+    n = max(hard.shape)
+    lab, k = ndimage.label(cand)
+    if not k:
+        return hard
+    garment = hard & ~cand
+    out_touch = ndimage.binary_dilation(~hard, iterations=1)
+    gar_touch = ndimage.binary_dilation(garment, iterations=1)
+    remove = np.zeros_like(hard)
+    for i, sl in enumerate(ndimage.find_objects(lab), 1):
+        # 少し広げた範囲で計算（速さのため）
+        y0, y1 = max(0, sl[0].start - 3), min(hard.shape[0], sl[0].stop + 3)
+        x0, x1 = max(0, sl[1].start - 3), min(hard.shape[1], sl[1].stop + 3)
+        reg = lab[y0:y1, x0:x1] == i
+        edge = ndimage.binary_dilation(reg, iterations=1) & ~reg
+        t_out = (edge & out_touch[y0:y1, x0:x1] & ~hard[y0:y1, x0:x1]).sum()
+        if t_out == 0:
+            continue  # 外とつながっていない＝服の柄など。消さない
+        t_gar = (edge & gar_touch[y0:y1, x0:x1] & garment[y0:y1, x0:x1]).sum()
+        frac = t_gar / max(1, t_gar + t_out)
+        thick = ndimage.distance_transform_edt(np.pad(reg, 1))[1:-1, 1:-1].max()
+        is_gap = frac >= 0.6                 # 服にはさまれたすき間
+        is_band = thick <= n * 0.006        # ふちに沿った細い帯
+        if is_gap or is_band:
+            remove[y0:y1, x0:x1] |= reg
+    return hard & ~remove
 
 
 def bbox_from_mask(mask: Image.Image, thresh: int = 20):
@@ -241,7 +372,7 @@ def analyze(path: Path, session: Segmenter | None, auto_rotate: bool = True) -> 
         if auto_rotate:
             # 判定は縮小画像で（股下のすき間もきれいにしてから）
             small = img.resize(_fit(img.size, 600), Image.BILINEAR)
-            m = refine_gaps(small, make_mask(small, session, raw))
+            m = make_mask(small, session, raw)
             info.update(orientation.detect(np.asarray(m)))
     thumb = img.copy()
     thumb.thumbnail((360, 360), Image.LANCZOS)
@@ -265,9 +396,7 @@ def extract_subject(path: Path, args, session, rotation: int = 0, raw: np.ndarra
         raw = rotate_raw(raw, rotation)
     if args.keep_bg:
         return img, None
-    mask = make_mask(img, session, raw)
-    if not args.no_refine:
-        mask = refine_gaps(img, mask)
+    mask = make_mask(img, session, raw, refine=not args.no_refine)
     box = bbox_from_mask(mask)
     if box is None:
         raise RuntimeError("商品を検出できませんでした")

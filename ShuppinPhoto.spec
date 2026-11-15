@@ -6,7 +6,7 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 APP_NAME = "ShuppinPhoto"
 DISPLAY_NAME = "出品写真ツール"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 datas, binaries, hiddenimports = [], [], []
 for pkg in ("tkinterdnd2", "onnxruntime"):

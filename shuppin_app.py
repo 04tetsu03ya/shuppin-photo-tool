@@ -254,7 +254,7 @@ class App:
         self.margin_lbl.pack(side="left")
 
         # ── 写真一覧 ──
-        f_list = ttk.LabelFrame(root, text="写真（ドラッグで並び替え ／ ⟲⟳で回転 ／ ✕で外す ／ 写真の間の丸ボタンで表・裏ペア）")
+        f_list = ttk.LabelFrame(root, text="写真（ドラッグで並び替え ／ 矢印ボタンで回転 ／ ×で外す ／ 写真の間の丸ボタンで表・裏ペア）")
         f_list.pack(fill="both", expand=True, **pad)
         bar = ttk.Frame(f_list); bar.pack(fill="x", padx=6, pady=(4, 2))
         ttk.Button(bar, text="写真を追加…", command=self.pick_files).pack(side="left")
@@ -506,15 +506,15 @@ class App:
                 elif it.confident:
                     txt, col = core_kind_label(it.kind), "#2a7a2a"
                 else:
-                    txt, col = "⚠ 向きを確認", "#d07000"
+                    txt, col = "向きを確認してください", "#d07000"
                 cv.create_text(cx, y + self.tile_h - 42 * self.sf, text=txt, fill=col,
                                font=(self.fam, self.fsize - 1), tags=tags)
-            # ボタン（⟲ ⟳ ✕）
+            # ボタン（左回転・右回転・外す）…文字ではなく図形で描く（どのPCでも同じ見た目）
             by = y + self.tile_h - 18 * self.sf
-            for sym, act, bx, col in (("⟲", "rotL", cx - 34 * self.sf, ACCENT), ("⟳", "rotR", cx, ACCENT),
-                                      ("✕", "del", x + self.tile_w - 18 * self.sf, "#c33")):
-                cv.create_text(bx, by, text=sym, fill=col, font=(self.fam, self.fsize + 6, "bold"),
-                               tags=("btn", act, tag))
+            self.draw_rotate_button(cx - 40 * self.sf, by, False, bg, ("btn", "rotL", tag))
+            self.draw_rotate_button(cx + 4 * self.sf, by, True, bg, ("btn", "rotR", tag))
+            self.draw_close_button(x + self.tile_w - 18 * self.sf, by, bg, ("btn", "del", tag))
+        # 以下はタイルのループの外
         # 写真と写真の間の「つなぐ」ボタン
         for i, it in enumerate(self.items[:-1]):
             x, y = self.tile_xy(i, cols)
@@ -522,6 +522,42 @@ class App:
         rows = (n + cols - 1) // cols
         cv.configure(scrollregion=(0, 0, cv.winfo_width(), self.gap + rows * (self.tile_h + self.gap)))
         self.update_count()
+
+    def draw_rotate_button(self, cx, cy, clockwise: bool, bg: str, tags):
+        """回転ボタン（円弧の矢印）"""
+        import math
+        cv, u = self.canvas, self.sf
+        r = 12 * u
+        cv.create_oval(cx - r, cy - r, cx + r, cy + r, fill=bg, outline="", tags=tags)  # 押せる範囲
+        rr = 8 * u
+        # 画面座標（下向きがy+）で、時計回りに 100°→370°（上が少し開いた輪）
+        angs = [math.radians(a) for a in range(-80, 191, 10)]
+        if not clockwise:  # 左右反転
+            angs = [math.pi - a for a in angs]
+        pts = []
+        for a in angs:
+            pts += [cx + rr * math.cos(a), cy + rr * math.sin(a)]
+        cv.create_line(*pts, fill=ACCENT, width=2.2 * u, capstyle="round", joinstyle="round", tags=tags)
+        # 矢じり（終点で進む向きに）
+        a = angs[-1]
+        dirv = (-math.sin(a), math.cos(a)) if clockwise else (math.sin(a), -math.cos(a))
+        ex, ey = cx + rr * math.cos(a), cy + rr * math.sin(a)
+        L, W = 6 * u, 4.2 * u
+        tip = (ex + dirv[0] * L * 0.6, ey + dirv[1] * L * 0.6)
+        base = (ex - dirv[0] * L * 0.4, ey - dirv[1] * L * 0.4)
+        nx, ny = -dirv[1], dirv[0]
+        cv.create_polygon(tip[0], tip[1], base[0] + nx * W, base[1] + ny * W, base[0] - nx * W, base[1] - ny * W,
+                          fill=ACCENT, outline=ACCENT, tags=tags)
+
+    def draw_close_button(self, cx, cy, bg: str, tags):
+        """外すボタン（×）"""
+        cv, u = self.canvas, self.sf
+        r = 12 * u
+        cv.create_oval(cx - r, cy - r, cx + r, cy + r, fill=bg, outline="", tags=tags)
+        d = 6 * u
+        for a, b in (((-d, -d), (d, d)), ((-d, d), (d, -d))):
+            cv.create_line(cx + a[0], cy + a[1], cx + b[0], cy + b[1], fill="#c33", width=2.4 * u,
+                           capstyle="round", tags=tags)
 
     def draw_link_button(self, cx, cy, it: Item):
         """鎖のマークの丸ボタン（つながっている＝青、つながっていない＝グレー）"""
