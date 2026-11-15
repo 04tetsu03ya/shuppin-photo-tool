@@ -44,6 +44,18 @@ jobs:
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
           & $iscc installer\windows.iss
+      - name: Silent update test (same way the in-app updater runs it)
+        shell: pwsh
+        run: |
+          Start-Process -Wait -FilePath "installer_out\ShuppinPhoto-Setup-Windows.exe" -ArgumentList "/SILENT","/SUPPRESSMSGBOXES","/NORESTART","/CLOSEAPPLICATIONS"
+          Start-Sleep -Seconds 5
+          $exe = Join-Path $env:LOCALAPPDATA "Programs\ShuppinPhoto\ShuppinPhoto.exe"
+          if (-not (Test-Path $exe)) { Write-Error "not installed: $exe"; exit 1 }
+          Write-Host "installed OK: $exe"
+          $running = Get-Process ShuppinPhoto -ErrorAction SilentlyContinue
+          if (-not $running) { Write-Error "app was not relaunched after silent install"; exit 1 }
+          Write-Host "relaunched OK"
+          Stop-Process -Name ShuppinPhoto -Force
       - uses: actions/upload-artifact@v4
         with:
           name: windows
@@ -96,10 +108,13 @@ jobs:
     if: always() && needs.windows.result == 'success'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: out
           merge-multiple: true
+      - name: Write version.txt (used by the in-app updater)
+        run: grep -oP 'APP_VERSION = "\K[0-9.]+' shuppin_app.py > out/version.txt && cat out/version.txt
       - name: Publish to "latest" release
         uses: softprops/action-gh-release@v2
         with:

@@ -42,6 +42,7 @@ def user_data_dir() -> Path:
 
 
 import shuppin_photo as core  # noqa: E402
+import updater  # noqa: E402
 
 os.environ.setdefault("SHUPPIN_MODEL_HOME", str(user_data_dir() / "models"))
 core.BUNDLED_MODEL_DIRS.append(HERE / "models")
@@ -55,7 +56,7 @@ except Exception:
 from PIL import Image, ImageTk  # noqa: E402
 
 APP_TITLE = "出品写真ツール"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 MODELS = {"標準（速い）": "isnet-general-use", "高精度（遅い）": "birefnet-general"}
 ANALYZE_MODEL = "isnet-general-use"
 SIZES = ["1200", "1080", "1500", "1000", "800"]
@@ -292,6 +293,8 @@ class App:
         f_run = ttk.Frame(root); f_run.pack(fill="x", padx=pad["padx"], pady=(0, int(10 * self.sf)))
         self.run_btn = ttk.Button(f_run, text="▶ 加工スタート", style="Big.TButton", command=self.start)
         self.run_btn.pack(side="right")
+        self.upd_btn = ttk.Button(f_run, text="更新を確認", command=lambda: self.check_update(manual=True))
+        self.upd_btn.pack(side="right", padx=(0, 10))
         st = ttk.Frame(f_run); st.pack(side="left", fill="x", expand=True, padx=(0, 12))
         self.status = ttk.Label(st, text="写真をここにドラッグ＆ドロップしてください")
         self.status.pack(anchor="w")
@@ -305,6 +308,7 @@ class App:
 
         threading.Thread(target=self.analyze_worker, daemon=True).start()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.after(3000, lambda: self.check_update(manual=False))
         root.after(100, self.poll)
         self.redraw()
 
@@ -774,6 +778,45 @@ class App:
         delta = e.delta if sys.platform == "darwin" else e.delta / 120
         self.canvas.yview_scroll(int(-delta * (1 if sys.platform == "darwin" else 3)), "units")
 
+    # ── 自動更新 ──
+    def check_update(self, manual: bool):
+        def work():
+            latest = updater.latest_version()
+            self.ui_q.put(("update_checked", latest, manual))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_update_checked(self, latest, manual):
+        if getattr(self, "updating", False):
+            return  # すでに更新中
+        if latest is None:
+            if manual:
+                messagebox.showwarning(APP_TITLE, "更新の確認ができませんでした。インターネット接続を確認してください。")
+            return
+        if not updater.is_newer(latest, APP_VERSION):
+            if manual:
+                messagebox.showinfo(APP_TITLE, f"最新版です（v{APP_VERSION}）")
+            return
+        if not updater.can_self_update():
+            messagebox.showinfo(APP_TITLE, f"新しいバージョン v{latest} が出ています（今は v{APP_VERSION}）。")
+            return
+        if self.processing:
+            if manual:
+                messagebox.showinfo(APP_TITLE, "加工中は更新できません。加工が終わってからもう一度押してください。")
+            return
+        if messagebox.askyesno(APP_TITLE, f"新しいバージョン v{latest} が出ています（今は v{APP_VERSION}）。\n\n"
+                                          "今すぐ更新しますか？\n（ダウンロードが終わるとアプリが自動で開き直します）"):
+            self.processing = True  # 更新中は操作させない
+            self.updating = True
+            self.run_btn.config(state="disabled"); self.upd_btn.config(state="disabled")
+
+            def work():
+                try:
+                    f = updater.download(lambda r: self.ui_q.put(("update_progress", r)))
+                    self.ui_q.put(("update_ready", f))
+                except Exception as e:
+                    self.ui_q.put(("update_failed", str(e)))
+            threading.Thread(target=work, daemon=True).start()
+
     # ── 加工 ──
     def start(self):
         if self.processing or not self.items:
@@ -850,6 +893,27 @@ class App:
                         self.redraw(); self.update_status()
                 elif kind == "status":
                     self.status.config(text=msg[1])
+                elif kind == "update_checked":
+                    self.on_update_checked(msg[1], msg[2])
+                elif kind == "update_progress":
+                    self.status.config(text=f"新しいバージョンをダウンロード中… {msg[1]*100:.0f}%")
+                    self.progress.config(maximum=100, value=msg[1] * 100)
+                elif kind == "update_ready":
+                    self.status.config(text="更新しています。アプリが自動で開き直します…")
+                    self.store_config()
+                    try:
+                        updater.install_and_restart(msg[1])
+                    except Exception as e:
+                        messagebox.showerror(APP_TITLE, f"更新できませんでした：{e}")
+                        self.processing = self.updating = False
+                        self.run_btn.config(state="normal"); self.upd_btn.config(state="normal")
+                    else:
+                        self.root.after(300, lambda: (self.root.destroy(), os._exit(0)))
+                elif kind == "update_failed":
+                    self.processing = self.updating = False
+                    self.run_btn.config(state="normal"); self.upd_btn.config(state="normal")
+                    self.status.config(text="更新のダウンロードに失敗しました")
+                    messagebox.showerror(APP_TITLE, "更新のダウンロードに失敗しました。\n" + msg[1])
                 elif kind == "total":
                     self.progress.config(maximum=msg[1], value=0)
                 elif kind == "step":

@@ -21,6 +21,8 @@ UninstallDisplayName=出品写真ツール
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+CloseApplications=force
+RestartApplications=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
@@ -39,3 +41,5 @@ Name: "{autodesktop}\出品写真ツール"; Filename: "{app}\ShuppinPhoto.exe";
 
 [Run]
 Filename: "{app}\ShuppinPhoto.exe"; Description: "{cm:LaunchProgram,出品写真ツール}"; Flags: nowait postinstall skipifsilent
+; 自動更新（静かなインストール）のあとは、アプリを自動で開き直す
+Filename: "{app}\ShuppinPhoto.exe"; Flags: nowait skipifnotsilent
