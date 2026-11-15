@@ -17,6 +17,7 @@ env:
 jobs:
   windows:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -47,8 +48,11 @@ jobs:
       - name: Silent update test (same way the in-app updater runs it)
         shell: pwsh
         run: |
-          Start-Process -Wait -FilePath "installer_out\ShuppinPhoto-Setup-Windows.exe" -ArgumentList "/SILENT","/SUPPRESSMSGBOXES","/NORESTART","/CLOSEAPPLICATIONS"
-          Start-Sleep -Seconds 5
+          # インストーラー本体の終了だけを待つ（再起動されたアプリの終了は待たない）
+          $p = Start-Process -PassThru -FilePath "installer_out\ShuppinPhoto-Setup-Windows.exe" -ArgumentList "/SILENT","/SUPPRESSMSGBOXES","/NORESTART","/CLOSEAPPLICATIONS"
+          if (-not $p.WaitForExit(300000)) { Write-Error "installer timed out"; exit 1 }
+          Write-Host "installer exit code: $($p.ExitCode)"
+          Start-Sleep -Seconds 8
           $exe = Join-Path $env:LOCALAPPDATA "Programs\ShuppinPhoto\ShuppinPhoto.exe"
           if (-not (Test-Path $exe)) { Write-Error "not installed: $exe"; exit 1 }
           Write-Host "installed OK: $exe"
