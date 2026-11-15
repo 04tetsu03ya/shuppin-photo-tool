@@ -6,14 +6,14 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 APP_NAME = "ShuppinPhoto"
 DISPLAY_NAME = "出品写真ツール"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 datas, binaries, hiddenimports = [], [], []
 for pkg in ("tkinterdnd2", "onnxruntime"):
     d, b, h = collect_all(pkg)
     datas += d; binaries += b; hiddenimports += h
 hiddenimports += collect_submodules("scipy.ndimage")
-hiddenimports += ["pillow_heif", "shuppin_photo"]
+hiddenimports += ["pillow_heif", "shuppin_photo", "orientation", "PIL.ImageTk"]
 
 datas += [("assets/icon.png", "assets")]
 if Path("models/isnet-general-use.onnx").exists():

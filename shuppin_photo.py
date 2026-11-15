@@ -33,6 +33,8 @@
   pip install onnxruntime pillow numpy scipy
 """
 
+from __future__ import annotations
+
 import argparse
 import sys
 from pathlib import Path
@@ -119,7 +121,8 @@ class Segmenter:
                                          providers=["CPUExecutionProvider"])
         self.input_name = self.sess.get_inputs()[0].name
 
-    def predict(self, img: Image.Image) -> Image.Image:
+    def predict_raw(self, img: Image.Image) -> np.ndarray:
+        """AIの生の出力（1024x1024, 0-255）。キャッシュして使い回せる"""
         im = np.asarray(img.convert("RGB").resize((1024, 1024), Image.LANCZOS), dtype=np.float32)
         im = im / max(float(im.max()), 1e-6)
         im = (im - np.array(self.mean, np.float32)) / np.array(self.std, np.float32)
@@ -129,18 +132,22 @@ class Segmenter:
             pred = 1 / (1 + np.exp(-pred))
         mi, ma = float(pred.min()), float(pred.max())
         pred = np.squeeze((pred - mi) / max(ma - mi, 1e-6))
-        mask = Image.fromarray((pred * 255).astype("uint8"), mode="L")
-        return mask.resize(img.size, Image.LANCZOS)
+        return (pred * 255).astype("uint8")
+
+    def predict(self, img: Image.Image, raw: np.ndarray | None = None) -> Image.Image:
+        if raw is None:
+            raw = self.predict_raw(img)
+        return Image.fromarray(raw, mode="L").resize(img.size, Image.LANCZOS)
 
 
 def new_session(name: str = "isnet-general-use", progress=None) -> Segmenter:
     return Segmenter(name, progress)
 
 
-def make_mask(img: Image.Image, session: Segmenter) -> Image.Image:
+def make_mask(img: Image.Image, session: Segmenter, raw: np.ndarray | None = None) -> Image.Image:
     """商品部分=255, 背景=0 のマスクを返す"""
     from scipy import ndimage
-    m = np.asarray(session.predict(img))
+    m = np.asarray(session.predict(img, raw))
     # 境界をなめらかにして2値化（小さなノイズも除去）
     cross = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], bool)
     m = ndimage.grey_opening(m, footprint=cross)
@@ -190,12 +197,75 @@ def parse_ratio(s: str):
     return float(w), float(h)
 
 
-def extract_subject(path: Path, args, session):
-    """商品部分だけを切り出す。(画像, マスク or None) を返す"""
+def rotate_img(img: Image.Image, rotation: int) -> Image.Image:
+    """時計回りに rotation 度（0/90/180/270）回す"""
+    r = rotation % 360
+    if r == 90:
+        return img.transpose(Image.ROTATE_270)
+    if r == 180:
+        return img.transpose(Image.ROTATE_180)
+    if r == 270:
+        return img.transpose(Image.ROTATE_90)
+    return img
+
+
+def rotate_raw(raw: np.ndarray, rotation: int) -> np.ndarray:
+    return np.rot90(raw, k=-(rotation % 360) // 90).copy()
+
+
+def capture_time(path: Path) -> float:
+    """撮影日時（Exif）。無ければファイルの更新日時"""
+    try:
+        with Image.open(path) as im:
+            ex = im.getexif()
+            dt = ex.get_ifd(0x8769).get(36867) or ex.get(306)
+            if dt:
+                import datetime as _dt
+                return _dt.datetime.strptime(str(dt).strip()[:19], "%Y:%m:%d %H:%M:%S").timestamp()
+    except Exception:
+        pass
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def analyze(path: Path, session: Segmenter | None, auto_rotate: bool = True) -> dict:
+    """一覧に表示する前の下調べ：AIマスク（キャッシュ用）、向き、サムネイル"""
+    import orientation
     img = load_image(path)
+    info = {"size": img.size, "raw": None, "rotation": 0, "kind": None, "confident": False}
+    if session is not None:
+        raw = session.predict_raw(img)
+        info["raw"] = raw
+        if auto_rotate:
+            # 判定は縮小画像で（股下のすき間もきれいにしてから）
+            small = img.resize(_fit(img.size, 600), Image.BILINEAR)
+            m = refine_gaps(small, make_mask(small, session, raw))
+            info.update(orientation.detect(np.asarray(m)))
+    thumb = img.copy()
+    thumb.thumbnail((360, 360), Image.LANCZOS)
+    if info["raw"] is not None:
+        tm = Image.fromarray(info["raw"]).resize(thumb.size, Image.BILINEAR)
+        thumb = Image.composite(thumb, Image.new("RGB", thumb.size, (255, 255, 255)), tm)
+    info["thumb"] = thumb
+    return info
+
+
+def _fit(size, max_side):
+    w, h = size
+    s = max_side / max(w, h)
+    return max(1, round(w * s)), max(1, round(h * s))
+
+
+def extract_subject(path: Path, args, session, rotation: int = 0, raw: np.ndarray | None = None):
+    """商品部分だけを切り出す。(画像, マスク or None) を返す"""
+    img = rotate_img(load_image(path), rotation)
+    if raw is not None:
+        raw = rotate_raw(raw, rotation)
     if args.keep_bg:
         return img, None
-    mask = make_mask(img, session)
+    mask = make_mask(img, session, raw)
     if not args.no_refine:
         mask = refine_gaps(img, mask)
     box = bbox_from_mask(mask)
@@ -249,8 +319,12 @@ def compose(items, args) -> Image.Image:
     return canvas
 
 
-def save(canvas: Image.Image, out_dir: Path, stem: str, args) -> Path:
+def save(canvas: Image.Image, out_dir: Path, stem: str, args, overwrite: bool = True) -> Path:
     out_path = out_dir / (stem + ".jpg")
+    n = 2
+    while not overwrite and out_path.exists():
+        out_path = out_dir / f"{stem}_{n}.jpg"
+        n += 1
     canvas.save(out_path, "JPEG", quality=args.quality, optimize=True, subsampling=0)
     return out_path
 
