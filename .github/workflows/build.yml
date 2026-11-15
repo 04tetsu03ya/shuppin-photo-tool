@@ -1,0 +1,107 @@
+name: build-apps
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PY_DEPS: pyinstaller onnxruntime pillow numpy scipy pillow-heif tkinterdnd2
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install ${{ env.PY_DEPS }}
+      - name: Download AI model
+        run: python scripts/fetch_model.py
+      - name: Build app
+        run: pyinstaller ShuppinPhoto.spec --noconfirm
+      - name: Self test
+        shell: pwsh
+        run: |
+          Start-Process -Wait -FilePath "dist\ShuppinPhoto\ShuppinPhoto.exe" -ArgumentList "--selftest","tests\samples","selftest_out"
+          Get-Content selftest_out\selftest.log
+          if ((Get-Content selftest_out\selftest.log -TotalCount 1) -ne "OK") { exit 1 }
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc installer\windows.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: installer_out/ShuppinPhoto-Setup-Windows.exe
+
+  mac:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: AppleSilicon
+          - runner: macos-15-intel
+            arch: Intel
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.arch == 'Intel' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install ${{ env.PY_DEPS }}
+      - name: Download AI model
+        run: python scripts/fetch_model.py
+      - name: Build app
+        run: |
+          pyinstaller ShuppinPhoto.spec --noconfirm
+          codesign --force --deep --sign - dist/ShuppinPhoto.app
+      - name: Self test
+        run: |
+          dist/ShuppinPhoto.app/Contents/MacOS/ShuppinPhoto --selftest tests/samples selftest_out || true
+          cat selftest_out/selftest.log
+          test "$(head -n1 selftest_out/selftest.log)" = "OK"
+      - name: Build dmg
+        run: |
+          mkdir dmg
+          cp -R dist/ShuppinPhoto.app "dmg/出品写真ツール.app"
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname "出品写真ツール" -srcfolder dmg -ov -format UDZO "ShuppinPhoto-Mac-${{ matrix.arch }}.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-${{ matrix.arch }}
+          path: ShuppinPhoto-Mac-${{ matrix.arch }}.dmg
+
+  release:
+    needs: [windows, mac]
+    if: always() && needs.windows.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Publish to "latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '最新版' }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          make_latest: true
+          files: out/*
+          body: |
+            ## ダウンロード
+            - **Windows**：ShuppinPhoto-Setup-Windows.exe
+            - **Mac（M1/M2/M3/M4）**：ShuppinPhoto-Mac-AppleSilicon.dmg
+            - **Mac（Intel）**：ShuppinPhoto-Mac-Intel.dmg

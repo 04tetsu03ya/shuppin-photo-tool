@@ -1,0 +1,8 @@
+build/
+dist/
+models/
+installer_out/
+selftest_out/
+__pycache__/
+*.pyc
+.DS_Store
