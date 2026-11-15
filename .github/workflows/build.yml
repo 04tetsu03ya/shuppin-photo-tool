@@ -10,6 +10,8 @@ permissions:
   contents: write
 
 env:
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: "1"
   PY_DEPS: pyinstaller onnxruntime pillow numpy scipy pillow-heif tkinterdnd2
 
 jobs:
