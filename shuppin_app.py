@@ -55,6 +55,7 @@ except Exception:
 from PIL import Image, ImageTk  # noqa: E402
 
 APP_TITLE = "出品写真ツール"
+APP_VERSION = "1.5.0"
 MODELS = {"標準（速い）": "isnet-general-use", "高精度（遅い）": "birefnet-general"}
 ANALYZE_MODEL = "isnet-general-use"
 SIZES = ["1200", "1080", "1500", "1000", "800"]
@@ -160,6 +161,10 @@ class Item:
         self.rotation = 0
         self.auto_rotation = 0
         self.link_next = False  # 次の写真と表・裏ペアにする
+        self.closeup = False    # アップ写真（背景を消さず正方形に切り抜く）
+        self.auto_closeup = False
+        self.crop = core.default_crop()
+        self.thumb_orig: Image.Image | None = None
         self.kind = None
         self.confident = False
         self.raw = None
@@ -181,7 +186,10 @@ def make_groups(items: list) -> list[list]:
 
 
 def normalize_links(items: list):
-    """1枚が2つのペアに入らないように整える"""
+    """1枚が2つのペアに入らないように整える（アップ写真はペアにしない）"""
+    for i, it in enumerate(items):
+        if it.closeup or (i + 1 < len(items) and items[i + 1].closeup):
+            it.link_next = False
     for g in make_groups(items):
         g[-1].link_next = False
         if len(g) == 1:
@@ -208,7 +216,7 @@ class App:
         self.thumb_box = int(128 * self.sf)
         self.gap = int(34 * self.sf)
 
-        root.title(APP_TITLE)
+        root.title(f"{APP_TITLE}  v{APP_VERSION}")
         root.geometry(f"{int(860 * self.sf)}x{int(720 * self.sf)}")
         root.minsize(int(620 * self.sf), int(520 * self.sf))
         style = ttk.Style()
@@ -274,6 +282,7 @@ class App:
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_motion)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
+        self.canvas.bind("<Double-Button-1>", self.on_double)
         for w in (self.canvas, root):
             w.bind("<MouseWheel>", self.on_wheel)
             w.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-3, "units"))
@@ -432,9 +441,13 @@ class App:
         return self.gap + c * (self.tile_w + self.gap), self.gap + r * (self.tile_h + self.gap)
 
     def photo_for(self, it: Item):
-        key = (it.id, it.rotation)
+        key = (it.id, it.rotation, it.closeup, it.crop)
         if key not in self.photos:
-            im = core.rotate_img(it.thumb, it.rotation).copy()
+            if it.closeup and it.thumb_orig is not None:
+                im = core.rotate_img(it.thumb_orig, it.rotation)
+                im = im.crop(core.crop_box(im.size, it.crop))
+            else:
+                im = core.rotate_img(it.thumb, it.rotation).copy()
             im.thumbnail((self.thumb_box, self.thumb_box), Image.LANCZOS)
             self.photos[key] = ImageTk.PhotoImage(im)
         return self.photos[key]
@@ -499,8 +512,14 @@ class App:
             name = it.path.name if len(it.path.name) <= 20 else it.path.name[:9] + "…" + it.path.name[-9:]
             cv.create_text(cx, y + self.tile_h - 62 * self.sf, text=name, fill="#666",
                            font=(self.fam, self.fsize - 2), tags=tags)
-            # 向きの判定結果
-            if it.state == "ready" and self.rot_var.get():
+            # 全体／アップ の切り替え（右上）
+            if it.state == "ready":
+                self.draw_mode_pill(x + self.tile_w - 8 * self.sf, y + 6 * self.sf, it.closeup, ("btn", "mode", tag))
+            # 向きの判定結果／アップ写真の案内
+            if it.state == "ready" and it.closeup:
+                cv.create_text(cx, y + self.tile_h - 42 * self.sf, text="切り抜き位置を調整", fill=ACCENT,
+                               font=(self.fam, self.fsize - 1, "underline"), tags=("btn", "crop", tag))
+            elif it.state == "ready" and self.rot_var.get():
                 if it.rotation != it.auto_rotation:
                     txt, col = "手動で回転", "#555"
                 elif it.confident:
@@ -517,11 +536,34 @@ class App:
         # 以下はタイルのループの外
         # 写真と写真の間の「つなぐ」ボタン
         for i, it in enumerate(self.items[:-1]):
+            if it.closeup or self.items[i + 1].closeup:
+                continue  # アップ写真はペアにしない
             x, y = self.tile_xy(i, cols)
             self.draw_link_button(x + self.tile_w + self.gap / 2, y + self.tile_h / 2, it)
         rows = (n + cols - 1) // cols
         cv.configure(scrollregion=(0, 0, cv.winfo_width(), self.gap + rows * (self.tile_h + self.gap)))
         self.update_count()
+
+    def draw_mode_pill(self, right, top, closeup: bool, tags):
+        """右上の「全体／アップ」切り替えボタン"""
+        cv, u = self.canvas, self.sf
+        txt = "アップ" if closeup else "全体"
+        f = (self.fam, self.fsize - 1, "bold")
+        w = tkfont.Font(family=self.fam, size=self.fsize - 1, weight="bold").measure(txt) + 16 * u
+        h = 20 * u
+        x0 = right - w
+        fill, fg = (("#7a4fd6", "white") if closeup else ("white", "#555"))
+        r = h / 2
+        cv.create_oval(x0, top, x0 + h, top + h, fill=fill, outline=fill if closeup else "#bbb", tags=tags)
+        cv.create_oval(right - h, top, right, top + h, fill=fill, outline=fill if closeup else "#bbb", tags=tags)
+        cv.create_rectangle(x0 + r, top, right - r, top + h, fill=fill, outline="", tags=tags)
+        if not closeup:
+            cv.create_line(x0 + r, top, right - r, top, fill="#bbb", tags=tags)
+            cv.create_line(x0 + r, top + h, right - r, top + h, fill="#bbb", tags=tags)
+        cv.create_text((x0 + right) / 2, top + h / 2, text=txt, fill=fg, font=f, tags=tags)
+
+    def open_crop(self, it: Item):
+        CropDialog(self, it)
 
     def draw_rotate_button(self, cx, cy, clockwise: bool, bg: str, tags):
         """回転ボタン（円弧の矢印）"""
@@ -635,7 +677,13 @@ class App:
         if it is None:
             return
         if "btn" in tags:
-            if "del" in tags:
+            if "mode" in tags:
+                it.closeup = not it.closeup
+                normalize_links(self.items)
+            elif "crop" in tags:
+                self.open_crop(it)
+                return
+            elif "del" in tags:
                 i = self.items.index(it)
                 if i > 0:
                     self.items[i - 1].link_next = False
@@ -643,8 +691,10 @@ class App:
                 normalize_links(self.items)
             elif "rotL" in tags:
                 it.rotation = (it.rotation - 90) % 360
+                it.crop = core.default_crop()
             elif "rotR" in tags:
                 it.rotation = (it.rotation + 90) % 360
+                it.crop = core.default_crop()
             self.redraw(); self.update_status()
             return
         x, y = self.canvas.canvasx(e.x), self.canvas.canvasy(e.y)
@@ -711,6 +761,15 @@ class App:
         normalize_links(self.items)
         self.redraw()
 
+    def on_double(self, e):
+        cur = self.canvas.find_withtag("current")
+        if not cur or self.processing:
+            return
+        it = self.item_by_tag(self.canvas.gettags(cur[0]))
+        if it is not None and it.state == "ready" and it.closeup:
+            self.drag = None
+            self.open_crop(it)
+
     def on_wheel(self, e):
         delta = e.delta if sys.platform == "darwin" else e.delta / 120
         self.canvas.yview_scroll(int(-delta * (1 if sys.platform == "darwin" else 3)), "units")
@@ -750,10 +809,15 @@ class App:
                 names = " + ".join(it.path.name for it in g)
                 q.put(("status", f"加工中 {n}/{len(groups)}：{names}"))
                 try:
-                    parts = [core.extract_subject(it.path, args, session, it.rotation, it.raw if reuse else None)
-                             for it in g]
                     stem = "+".join(it.path.stem for it in g)
-                    core.save(core.compose(parts, args), out_dir, stem, args, overwrite=False)
+                    if len(g) == 1 and g[0].closeup:
+                        it = g[0]
+                        canvas = core.render_closeup(it.path, args, it.rotation, it.crop, raw=it.raw)
+                    else:
+                        parts = [core.extract_subject(it.path, args, session, it.rotation, it.raw if reuse else None)
+                                 for it in g]
+                        canvas = core.compose(parts, args)
+                    core.save(canvas, out_dir, stem, args, overwrite=False)
                     ok += 1
                 except Exception as e:
                     ng += 1
@@ -774,6 +838,9 @@ class App:
                     it.kind, it.confident = info["kind"], info["confident"]
                     it.auto_rotation = info["rotation"]
                     it.rotation = info["rotation"] if self.rot_var.get() else 0
+                    it.closeup = it.auto_closeup = info.get("closeup", False)
+                    it.thumb_orig = info.get("thumb_orig")
+                    normalize_links(self.items)
                     if it in self.items:
                         self.redraw(); self.update_status()
                 elif kind == "analyze_error":
@@ -807,6 +874,124 @@ class App:
         except queue.Empty:
             pass
         self.root.after(80, self.poll)
+
+
+class CropDialog:
+    """アップ写真の切り抜き位置を決める画面：正方形の枠をドラッグで移動、角や下のつまみで大きさを変える"""
+
+    def __init__(self, app: "App", it: Item):
+        self.app, self.it = app, it
+        sf = app.sf
+        self.win = tk.Toplevel(app.root)
+        self.win.title("切り抜き位置の調整")
+        self.win.transient(app.root)
+        img = core.rotate_img(core.load_image(it.path), it.rotation)
+        self.W, self.H = img.size
+        box = int(min(640 * sf, app.root.winfo_screenheight() * 0.7))
+        disp = img.copy()
+        disp.thumbnail((box, box), Image.LANCZOS)
+        self.k = disp.size[0] / self.W  # 表示倍率
+        from PIL import ImageEnhance
+        self.disp = disp
+        self.photo_dark = ImageTk.PhotoImage(ImageEnhance.Brightness(disp).enhance(0.35))  # 枠の外は暗く
+        self.photo_crop = None
+        self.cv = tk.Canvas(self.win, width=disp.size[0], height=disp.size[1], highlightthickness=0, bg="#333")
+        self.cv.pack(padx=int(12 * sf), pady=(int(12 * sf), int(6 * sf)))
+        self.cv.create_image(0, 0, image=self.photo_dark, anchor="nw")
+        ttk.Label(self.win, text="枠の中をドラッグで移動／角をドラッグ・マウスホイール・下のつまみで大きさを変更"
+                  ).pack(padx=12)
+        row = ttk.Frame(self.win); row.pack(fill="x", padx=int(12 * sf), pady=int(6 * sf))
+        ttk.Label(row, text="大きさ").pack(side="left")
+        self.size_var = tk.DoubleVar(value=it.crop[2] * 100)
+        ttk.Scale(row, from_=15, to=100, variable=self.size_var, length=int(260 * sf),
+                  command=lambda v: self.set_size(float(v) / 100)).pack(side="left", padx=8)
+        btns = ttk.Frame(self.win); btns.pack(fill="x", padx=int(12 * sf), pady=(0, int(12 * sf)))
+        ttk.Button(btns, text="中央・最大に戻す", command=self.reset).pack(side="left")
+        ttk.Button(btns, text="OK", command=self.ok).pack(side="right")
+        ttk.Button(btns, text="キャンセル", command=self.win.destroy).pack(side="right", padx=6)
+        self.crop = list(it.crop)
+        self.mode = None
+        self.cv.bind("<ButtonPress-1>", self.press)
+        self.cv.bind("<B1-Motion>", self.motion)
+        self.cv.bind("<ButtonRelease-1>", lambda e: setattr(self, "mode", None))
+        self.cv.bind("<MouseWheel>", self.wheel)
+        self.cv.bind("<Button-4>", lambda e: self.set_size(self.crop[2] * 1.05))
+        self.cv.bind("<Button-5>", lambda e: self.set_size(self.crop[2] / 1.05))
+        self.draw()
+        try:
+            self.win.grab_set()
+        except tk.TclError:
+            pass
+
+    def box_disp(self):
+        x0, y0, x1, y1 = core.crop_box((self.W, self.H), self.crop)
+        return x0 * self.k, y0 * self.k, x1 * self.k, y1 * self.k
+
+    def draw(self):
+        cv = self.cv
+        cv.delete("ov")
+        x0, y0, x1, y1 = self.box_disp()
+        # 枠の中だけ明るい写真を重ねる（どのOSでも同じ見た目）
+        bx = (int(x0), int(y0), max(int(x0) + 1, int(x1)), max(int(y0) + 1, int(y1)))
+        self.photo_crop = ImageTk.PhotoImage(self.disp.crop(bx))
+        cv.create_image(bx[0], bx[1], image=self.photo_crop, anchor="nw", tags="ov")
+        cv.create_rectangle(x0, y0, x1, y1, outline="white", width=2, tags="ov")
+        for i in (1, 2):  # 3分割の目安線
+            cv.create_line(x0 + (x1 - x0) * i / 3, y0, x0 + (x1 - x0) * i / 3, y1, fill="#ffffff", dash=(3, 4), tags="ov")
+            cv.create_line(x0, y0 + (y1 - y0) * i / 3, x1, y0 + (y1 - y0) * i / 3, fill="#ffffff", dash=(3, 4), tags="ov")
+        hs = 7 * self.app.sf
+        for (cx, cy) in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
+            cv.create_rectangle(cx - hs, cy - hs, cx + hs, cy + hs, fill="white", outline=ACCENT, width=2, tags="ov")
+
+    def clamp(self):
+        x0, y0, x1, y1 = core.crop_box((self.W, self.H), self.crop)
+        self.crop[0] = (x0 + x1) / 2 / self.W
+        self.crop[1] = (y0 + y1) / 2 / self.H
+
+    def set_size(self, sz):
+        self.crop[2] = float(min(1.0, max(0.15, sz)))
+        self.clamp()
+        self.size_var.set(self.crop[2] * 100)
+        self.draw()
+
+    def press(self, e):
+        x0, y0, x1, y1 = self.box_disp()
+        hs = 12 * self.app.sf
+        corner = any(abs(e.x - cx) < hs and abs(e.y - cy) < hs for cx in (x0, x1) for cy in (y0, y1))
+        if corner:
+            self.mode = "resize"
+        elif x0 <= e.x <= x1 and y0 <= e.y <= y1:
+            self.mode = "move"
+        else:  # 枠の外をクリック → そこへ枠を移動
+            self.mode = "move"
+            self.crop[0], self.crop[1] = e.x / self.k / self.W, e.y / self.k / self.H
+            self.clamp(); self.draw()
+        self.last = (e.x, e.y)
+
+    def motion(self, e):
+        if self.mode == "move":
+            dx, dy = e.x - self.last[0], e.y - self.last[1]
+            self.crop[0] += dx / self.k / self.W
+            self.crop[1] += dy / self.k / self.H
+            self.clamp(); self.draw()
+        elif self.mode == "resize":
+            cx, cy = self.crop[0] * self.W * self.k, self.crop[1] * self.H * self.k
+            half = max(abs(e.x - cx), abs(e.y - cy))
+            self.set_size(2 * half / self.k / min(self.W, self.H))
+        self.last = (e.x, e.y)
+
+    def wheel(self, e):
+        self.set_size(self.crop[2] * (1.05 if e.delta > 0 else 1 / 1.05))
+
+    def reset(self):
+        self.crop = list(core.default_crop())
+        self.size_var.set(100)
+        self.draw()
+
+    def ok(self):
+        self.it.crop = tuple(self.crop)
+        self.win.destroy()
+        self.app.redraw()
 
 
 def core_kind_label(kind):

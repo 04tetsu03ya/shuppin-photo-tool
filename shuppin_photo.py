@@ -91,12 +91,24 @@ def model_path(name: str, progress=None) -> Path:
             return f
     dst = model_home() / fname
     tmp = dst.with_suffix(".part")
-
-    def hook(blocks, bsize, total):
-        if progress and total > 0:
-            progress(min(1.0, blocks * bsize / total))
-
-    urllib.request.urlretrieve(url, tmp, reporthook=hook)
+    try:
+        with urllib.request.urlopen(url, context=_ssl_context(), timeout=60) as r, open(tmp, "wb") as fh:
+            total = int(r.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                done += len(chunk)
+                if progress and total:
+                    progress(min(1.0, done / total))
+    except Exception as e:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(
+            "切り抜きAI（高精度）のダウンロードに失敗しました。インターネット接続を確認してください。"
+            "会社のネットワークやセキュリティソフトが通信を止めている場合もあります。"
+            "「標準」の精度ならダウンロードなしで使えます。\n（詳細: " + str(e) + "）") from None
     h = hashlib.md5()
     with open(tmp, "rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
@@ -106,6 +118,21 @@ def model_path(name: str, progress=None) -> Path:
         raise RuntimeError("モデルのダウンロードが壊れています。もう一度お試しください")
     tmp.replace(dst)
     return dst
+
+
+def _ssl_context():
+    """パソコンに登録されている証明書を使って安全に接続する（セキュリティソフト等にも対応）"""
+    import ssl
+    try:
+        import truststore
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except Exception:
+        pass
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
 
 
 class Segmenter:
@@ -147,6 +174,15 @@ def new_session(name: str = "isnet-general-use", progress=None) -> Segmenter:
 WORK_SIDE = 1600  # 切り抜きの計算はこの大きさで行い、最後になめらかに拡大する
 
 
+def _morph(op: str, m: np.ndarray, r: int) -> np.ndarray:
+    """写真のふちで欠けないように、ふちを延長してから開閉処理する"""
+    from scipy import ndimage
+    pad = r + 2
+    mp = np.pad(m, pad, mode="edge")
+    f = ndimage.binary_opening if op == "open" else ndimage.binary_closing
+    return f(mp, structure=_disk(r))[pad:-pad, pad:-pad]
+
+
 def _disk(r: int) -> np.ndarray:
     y, x = np.ogrid[-r:r + 1, -r:r + 1]
     return x * x + y * y <= r * r
@@ -175,7 +211,7 @@ def make_mask(img: Image.Image, session: Segmenter, raw: np.ndarray | None = Non
             hard = (sm >= 0.5) & ~removed
     if refine:
         hard = edge_cleanup(work, hard, soft)
-        hard = ndimage.binary_opening(hard, structure=_disk(1))
+        hard = _morph("open", hard, 1)
     return upscale_mask(hard, img.size)
 
 
@@ -200,10 +236,10 @@ def clean_mask(hard: np.ndarray) -> np.ndarray:
         hard = hard | np.isin(lab, small)
     # 3) 輪郭をなめらかに（小さなトゲ・欠けをならす）
     r = max(1, round(n * 0.0025))
-    hard = ndimage.binary_opening(hard, structure=_disk(r))
-    hard = ndimage.binary_closing(hard, structure=_disk(r))
+    hard = _morph("open", hard, r)
+    hard = _morph("close", hard, r)
     # 4) さらに輪郭のガタつきをぼかして整える
-    sm = ndimage.gaussian_filter(hard.astype(np.float32), sigma=max(1.0, n * 0.0015))
+    sm = ndimage.gaussian_filter(hard.astype(np.float32), sigma=max(1.0, n * 0.0015), mode="nearest")
     return sm >= 0.5
 
 
@@ -242,7 +278,7 @@ def edge_cleanup(img: Image.Image, hard: np.ndarray, soft: np.ndarray | None = N
     contrast = np.linalg.norm(bg_l - fg_l, axis=2)
     cand = ring_in & (d_bg < d_fg * 0.7) & (contrast > 30)
     # 細い部分だけ（太い塊＝タグ等は残す）
-    thin = cand & ~ndimage.binary_opening(cand, structure=_disk(r * 2))
+    thin = cand & ~_morph("open", cand, r * 2)
     # 外の背景とつながっているものだけ
     lab, _ = ndimage.label(thin | out)
     ids = np.unique(lab[out])
@@ -250,7 +286,7 @@ def edge_cleanup(img: Image.Image, hard: np.ndarray, soft: np.ndarray | None = N
     # 背景色っぽい部分が内側まで「かたまり」で続いている＝タグ等の物体。消さない
     if thin.any():
         bglike = hard & (d_bg < d_fg * 0.7) & (contrast > 30)
-        core = ndimage.binary_opening(bglike, structure=_disk(r * 2))
+        core = _morph("open", bglike, r * 2)
         if core.any():
             lab, _ = ndimage.label(bglike)
             ids = np.unique(lab[core])
@@ -367,17 +403,18 @@ def analyze(path: Path, session: Segmenter | None, auto_rotate: bool = True) -> 
     """一覧に表示する前の下調べ：AIマスク（キャッシュ用）、向き、サムネイル"""
     import orientation
     img = load_image(path)
-    info = {"size": img.size, "raw": None, "rotation": 0, "kind": None, "confident": False}
+    info = {"size": img.size, "raw": None, "rotation": 0, "kind": None, "confident": False, "closeup": False}
     if session is not None:
         raw = session.predict_raw(img)
         info["raw"] = raw
-        if auto_rotate:
-            # 判定は縮小画像で（股下のすき間もきれいにしてから）
-            small = img.resize(_fit(img.size, 600), Image.BILINEAR)
-            m = make_mask(small, session, raw)
-            info.update(orientation.detect(np.asarray(m)))
+        small = img.resize(_fit(img.size, 600), Image.BILINEAR)
+        m = np.asarray(make_mask(small, session, raw))
+        info["closeup"] = is_closeup(m)
+        if auto_rotate and not info["closeup"]:
+            info.update(orientation.detect(m))
     thumb = img.copy()
     thumb.thumbnail((360, 360), Image.LANCZOS)
+    info["thumb_orig"] = thumb.copy()
     if info["raw"] is not None:
         tm = Image.fromarray(info["raw"]).resize(thumb.size, Image.BILINEAR)
         thumb = Image.composite(thumb, Image.new("RGB", thumb.size, (255, 255, 255)), tm)
@@ -389,6 +426,90 @@ def _fit(size, max_side):
     w, h = size
     s = max_side / max(w, h)
     return max(1, round(w * s)), max(1, round(h * s))
+
+
+# ── アップ写真（素材感・ボタン・ジップなど） ─────────────────────────
+def is_closeup(mask: np.ndarray) -> bool:
+    """服が画面いっぱい（2辺以上のふちにかかる・大きく写る）ならアップ写真とみなす"""
+    m = mask > 127 if mask.dtype != bool else mask
+    area = float(m.mean())
+    edges = [m[:3].mean(), m[-3:].mean(), m[:, :3].mean(), m[:, -3:].mean()]
+    touching = sum(1 for e in edges if e > 0.15)
+    return area > 0.6 or (touching >= 2 and sum(edges) >= 0.6) or touching >= 3
+
+
+def default_crop() -> tuple:
+    """(中心x, 中心y, 一辺) … いずれも写真に対する割合。一辺は短い辺に対する割合"""
+    return (0.5, 0.5, 1.0)
+
+
+def crop_box(size, crop) -> tuple:
+    w, h = size
+    cx, cy, sz = crop
+    side = max(16, min(w, h) * min(1.0, max(0.05, sz)))
+    x0 = min(max(0, cx * w - side / 2), w - side)
+    y0 = min(max(0, cy * h - side / 2), h - side)
+    return int(round(x0)), int(round(y0)), int(round(x0 + side)), int(round(y0 + side))
+
+
+def whiten_board(img: Image.Image, protect: Image.Image | None = None) -> Image.Image:
+    """写り込んだ白い板・白い床（写真のふちにつながっている部分）だけを白くする。
+    タグ（色つきの紙）や服は残す"""
+    from scipy import ndimage
+    work = img if max(img.size) <= 1200 else img.resize(_fit(img.size, 1200), Image.LANCZOS)
+    arr = ndimage.gaussian_filter(np.asarray(work, dtype=np.float32), sigma=(2, 2, 0))
+    h, w = arr.shape[:2]
+    L = arr.mean(axis=2)
+    chroma = arr.max(axis=2) - arr.min(axis=2)
+    bright_neutral = (L >= 170) & (chroma <= 25)
+    b = max(3, int(min(h, w) * 0.02))
+    border = np.zeros((h, w), bool)
+    border[:b] = border[-b:] = True
+    border[:, :b] = border[:, -b:] = True
+    seed = border & bright_neutral
+    if seed.sum() < border.sum() * 0.05:
+        return img  # 白い板が写っていない
+    board = np.median(arr[seed], axis=0)
+    d = np.linalg.norm(arr - board, axis=2)
+    tol = float(np.clip(np.percentile(d[seed], 90) * 1.5, 18, 45))
+    board_L = float(board.mean())
+    # 板そのもの＋影で少し暗くなった板（無彩色のまま明るさだけ下がった所）
+    bg = (d < tol) | ((chroma <= 12) & (L >= board_L * 0.68))
+    if protect is not None:  # AIが商品（服・タグ）と確信している所は白くしない
+        bg &= ~(np.asarray(protect.resize((w, h), Image.BILINEAR)) >= 200)
+    lab, _ = ndimage.label(bg)
+    ids = np.unique(lab[seed])
+    bg = np.isin(lab, ids[ids > 0])
+    # 点々を作らないように整える
+    r = max(2, round(max(h, w) * 0.004))
+    bg = _morph("open", bg, r)
+    bg = _morph("close", bg, r)
+    lab, k = ndimage.label(bg)
+    if k:
+        areas = ndimage.sum(bg, lab, index=np.arange(1, k + 1))
+        bg = np.isin(lab, np.flatnonzero(areas >= h * w * 0.002) + 1)
+    if not bg.any():
+        return img
+    a = Image.fromarray(bg.astype(np.uint8) * 255).resize(img.size, Image.BILINEAR)
+    a = np.asarray(a.filter(ImageFilter.GaussianBlur(max(1.0, img.size[0] / w * 1.2)))).astype(np.float32)[..., None] / 255
+    out = np.asarray(img, dtype=np.float32) * (1 - a) + 255 * a
+    return Image.fromarray(out.clip(0, 255).astype(np.uint8))
+
+
+def render_closeup(path: Path, args, rotation: int = 0, crop=None, whiten: bool = True,
+                   raw: np.ndarray | None = None) -> Image.Image:
+    """アップ写真：正方形に切り抜き（位置は crop）、白い板を白くして出力サイズにする"""
+    img = rotate_img(load_image(path), rotation)
+    box = crop_box(img.size, crop or default_crop())
+    sq = img.crop(box)
+    protect = None
+    if raw is not None:
+        protect = Image.fromarray(rotate_raw(raw, rotation)).resize(img.size, Image.BILINEAR).crop(box)
+    if sq.size[0] > args.size * 1.5:
+        sq = sq.resize((int(args.size * 1.5),) * 2, Image.LANCZOS)
+    if whiten and not args.keep_bg:
+        sq = whiten_board(sq, protect)
+    return sq.resize((args.size, args.size), Image.LANCZOS)
 
 
 def extract_subject(path: Path, args, session, rotation: int = 0, raw: np.ndarray | None = None):
