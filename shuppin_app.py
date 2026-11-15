@@ -56,7 +56,7 @@ except Exception:
 from PIL import Image, ImageTk  # noqa: E402
 
 APP_TITLE = "出品写真ツール"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 MODELS = {"標準（速い）": "isnet-general-use", "高精度（遅い）": "birefnet-general"}
 ANALYZE_MODEL = "isnet-general-use"
 SIZES = ["1200", "1080", "1500", "1000", "800"]
@@ -383,11 +383,36 @@ class App:
 
     def set_all_links(self, on: bool):
         if self.processing:
+            self.status.config(text="加工中はペアを変更できません")
             return
-        for i, it in enumerate(self.items):
-            it.link_next = on and i % 2 == 0
+        for it in self.items:
+            it.link_next = False
+        skipped = 0
+        if on:
+            # 一覧の順に「全体」の写真を2枚ずつ（アップ写真は飛ばす）
+            i = 0
+            while i < len(self.items) - 1:
+                a, b = self.items[i], self.items[i + 1]
+                if a.closeup:
+                    skipped += 1; i += 1; continue
+                if b.closeup:
+                    skipped += 1; i += 2; continue
+                a.link_next = True
+                i += 2
+            skipped += sum(1 for it in self.items[i:] if it.closeup)
         normalize_links(self.items)
         self.redraw()
+        if skipped:
+            self.status.config(text=f"「アップ」の写真 {skipped}枚はペアにしませんでした"
+                                    "（ペアにしたい場合は写真右上の「アップ」を押して「全体」に）")
+
+    def ensure_full(self, *its):
+        """ペアにするときは「全体」写真として扱う"""
+        changed = [it for it in its if it.closeup]
+        for it in changed:
+            it.closeup = False
+        if changed:
+            self.status.config(text="ペアにするため「アップ」を「全体」に切り替えました")
 
     def toggle_link(self, it: Item):
         i = self.items.index(it)
@@ -396,6 +421,7 @@ class App:
         if it.link_next:
             it.link_next = False
         else:
+            self.ensure_full(it, self.items[i + 1])
             # つなぐ2枚が、ほかのペアに入っていたら外す
             if i > 0:
                 self.items[i - 1].link_next = False
@@ -540,8 +566,6 @@ class App:
         # 以下はタイルのループの外
         # 写真と写真の間の「つなぐ」ボタン
         for i, it in enumerate(self.items[:-1]):
-            if it.closeup or self.items[i + 1].closeup:
-                continue  # アップ写真はペアにしない
             x, y = self.tile_xy(i, cols)
             self.draw_link_button(x + self.tile_w + self.gap / 2, y + self.tile_h / 2, it)
         rows = (n + cols - 1) // cols
@@ -666,6 +690,7 @@ class App:
 
     def on_press(self, e):
         if self.processing:
+            self.status.config(text="加工中は変更できません。終わるまでお待ちください")
             return
         cur = self.canvas.find_withtag("current")
         if not cur:

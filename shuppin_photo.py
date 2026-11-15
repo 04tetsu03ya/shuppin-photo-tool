@@ -434,8 +434,11 @@ def is_closeup(mask: np.ndarray) -> bool:
     m = mask > 127 if mask.dtype != bool else mask
     area = float(m.mean())
     edges = [m[:3].mean(), m[-3:].mean(), m[:, :3].mean(), m[:, -3:].mean()]
-    touching = sum(1 for e in edges if e > 0.15)
-    return area > 0.6 or (touching >= 2 and sum(edges) >= 0.6) or touching >= 3
+    top, bottom, left, right = (e > 0.15 for e in edges)
+    touching = top + bottom + left + right
+    # 隣り合う2辺（角）にかかる＝寄って撮った写真。上下だけ・左右だけは長い服の全体写真
+    corner = (top or bottom) and (left or right)
+    return area > 0.6 or touching >= 3 or (corner and sum(edges) >= 0.6)
 
 
 def default_crop() -> tuple:
