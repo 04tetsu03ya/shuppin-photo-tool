@@ -167,35 +167,14 @@ def make_mask(img: Image.Image, session: Segmenter, raw: np.ndarray | None = Non
     hard = np.isin(lab, ids[ids > 0]) if sure.any() else sure
     hard = clean_mask(hard)
     if refine:
-        refined = refine_gaps(work, hard)
+        refined = refine_gaps(work, hard, soft)
         removed = hard & ~refined
         if removed.any():
-            # すき間のまわり（影で少し暗い先端など）：すき間の色と服の色のどちらに近いかで判定
-            arr = ndimage.gaussian_filter(np.asarray(work, dtype=np.float32), sigma=(1.0, 1.0, 0))
-            r0 = max(2, round(max(hard.shape) * 0.003))
-            near = ndimage.binary_dilation(removed, structure=_disk(r0 * 4)) & refined
-            if near.any():
-                gap_col = np.median(arr[removed], axis=0)
-                fg_col = np.median(arr[near], axis=0)
-                if np.linalg.norm(gap_col - fg_col) > 25:  # 服と背景の色がはっきり違うときだけ
-                    d_gap = np.linalg.norm(arr - gap_col, axis=2)
-                    d_fg = np.linalg.norm(arr - fg_col, axis=2)
-                    extra = near & (d_gap < d_fg * 0.8)
-                    lab, _ = ndimage.label(extra | removed)
-                    ids = np.unique(lab[removed])
-                    extra &= np.isin(lab, ids[ids > 0])
-                    removed |= extra
-                    refined &= ~extra
             # すき間を消したあと、ふちを軽く整える（消した背景は戻さない）
             sm = ndimage.gaussian_filter(refined.astype(np.float32), sigma=max(1.0, max(hard.shape) * 0.001))
             hard = (sm >= 0.5) & ~removed
-            # すき間の先端に残る細い糸のような背景も消す（すき間のまわりだけ）
-            r = max(2, round(max(hard.shape) * 0.003))
-            near = ndimage.binary_dilation(removed, structure=_disk(r * 3))
-            opened = ndimage.binary_opening(hard, structure=_disk(r))
-            hard = np.where(near, opened, hard)
     if refine:
-        hard = edge_cleanup(work, hard)
+        hard = edge_cleanup(work, hard, soft)
         hard = ndimage.binary_opening(hard, structure=_disk(1))
     return upscale_mask(hard, img.size)
 
@@ -239,7 +218,7 @@ def upscale_mask(hard: np.ndarray, size) -> Image.Image:
     return Image.fromarray(a.astype(np.uint8))
 
 
-def edge_cleanup(img: Image.Image, hard: np.ndarray) -> np.ndarray:
+def edge_cleanup(img: Image.Image, hard: np.ndarray, soft: np.ndarray | None = None) -> np.ndarray:
     """輪郭ぞいに残った「背景色の細い切れ端」（すき間の先端・ふちの影の帯など）を消す。
     近くの背景の色と近くの服の色を比べ、背景に近い“細い”部分だけを消す（タグなど大きな物は残す）"""
     from scipy import ndimage
@@ -268,22 +247,43 @@ def edge_cleanup(img: Image.Image, hard: np.ndarray) -> np.ndarray:
     lab, _ = ndimage.label(thin | out)
     ids = np.unique(lab[out])
     thin &= np.isin(lab, ids[ids > 0])
+    # 背景色っぽい部分が内側まで「かたまり」で続いている＝タグ等の物体。消さない
+    if thin.any():
+        bglike = hard & (d_bg < d_fg * 0.7) & (contrast > 30)
+        core = ndimage.binary_opening(bglike, structure=_disk(r * 2))
+        if core.any():
+            lab, _ = ndimage.label(bglike)
+            ids = np.unique(lab[core])
+            thin &= ~np.isin(lab, ids[ids > 0])
+    # AIが「商品の一部」と確信している所（タグ・ラベル等）は消さない
+    if soft is not None and thin.any():
+        lab, k = ndimage.label(thin)
+        means = ndimage.mean(soft, lab, index=np.arange(1, k + 1))
+        thin &= np.isin(lab, np.flatnonzero(np.asarray(means) < 215) + 1)
     return hard & ~thin
 
 
-def refine_gaps(img: Image.Image, hard: np.ndarray) -> np.ndarray:
+def refine_gaps(img: Image.Image, hard: np.ndarray, soft: np.ndarray | None = None) -> np.ndarray:
     """パンツの股下や、袖と胴のすき間など「AIが商品扱いした背景」を消す。
     ・背景とほぼ同じ色で、外の背景とつながっている部分だけが対象
     ・消すのは「服にはさまれたすき間」か「ふちの細い帯（影など）」だけ。
       タグのように外に張り出した物は、背景と同じ色でも消さない"""
     from scipy import ndimage
     arr = ndimage.gaussian_filter(np.asarray(img, dtype=np.float32), sigma=(1.5, 1.5, 0))
+    n = max(hard.shape)
     outside = ~ndimage.binary_dilation(hard, iterations=2)
     if outside.sum() < 1000 or not hard.any():
         return hard
-    bg = np.median(arr[outside], axis=0)
-    dist = np.linalg.norm(arr - bg, axis=2)
-    thresh = max(14.0, float(np.percentile(dist[outside], 90)) * 1.3)
+    # 服のすぐ外側（帯状）の色を「その場所の背景色」とする（床・板・マットが混ざっていてもOK）
+    ring = outside & ndimage.binary_dilation(hard, structure=_disk(max(3, round(n * 0.02))))
+    if ring.sum() < 500:
+        return hard
+    sig = n * 0.03
+    w = ndimage.gaussian_filter(ring.astype(np.float32), sig) + 1e-6
+    bg_l = np.stack([ndimage.gaussian_filter(arr[..., ch] * ring, sig) / w for ch in range(3)], -1)
+    dist = np.linalg.norm(arr - bg_l, axis=2)
+    noise = float(np.percentile(dist[ring], 75))
+    thresh = float(np.clip(noise * 2.0, 12, 30))  # 厳しめ：背景とほぼ同じ色だけ
     cand = (dist < thresh) & hard
     # 商品自体が背景と似た色（白い服を白い床で撮った等）なら何もしない
     if cand.sum() > hard.sum() * 0.25:
@@ -310,7 +310,9 @@ def refine_gaps(img: Image.Image, hard: np.ndarray) -> np.ndarray:
         thick = ndimage.distance_transform_edt(np.pad(reg, 1))[1:-1, 1:-1].max()
         is_gap = frac >= 0.6                 # 服にはさまれたすき間
         is_band = thick <= n * 0.006        # ふちに沿った細い帯
-        if is_gap or is_band:
+        # AIが「商品の一部」と確信している所（タグ・ラベル等）は消さない
+        sure = soft is not None and float(soft[y0:y1, x0:x1][reg].mean()) >= 200
+        if (is_gap or is_band) and not sure:
             remove[y0:y1, x0:x1] |= reg
     return hard & ~remove
 

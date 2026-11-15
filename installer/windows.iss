@@ -1,7 +1,7 @@
 ﻿; 出品写真ツール Windows インストーラー（Inno Setup 6）
 #define AppVer GetEnv("APP_VERSION")
 #if AppVer == ""
-  #define AppVer "1.3.0"
+  #define AppVer "1.4.0"
 #endif
 
 [Setup]
