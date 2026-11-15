@@ -159,11 +159,33 @@ class Item:
         self.state = "wait"  # wait / ready / error
         self.rotation = 0
         self.auto_rotation = 0
+        self.link_next = False  # 次の写真と表・裏ペアにする
         self.kind = None
         self.confident = False
         self.raw = None
         self.thumb: Image.Image | None = None
         self.error = ""
+
+
+def make_groups(items: list) -> list[list]:
+    """一覧の順に、つながっている2枚はペア、それ以外は1枚ずつ"""
+    groups, i = [], 0
+    while i < len(items):
+        if items[i].link_next and i + 1 < len(items):
+            groups.append([items[i], items[i + 1]])
+            i += 2
+        else:
+            groups.append([items[i]])
+            i += 1
+    return groups
+
+
+def normalize_links(items: list):
+    """1枚が2つのペアに入らないように整える"""
+    for g in make_groups(items):
+        g[-1].link_next = False
+        if len(g) == 1:
+            g[0].link_next = False
 
 
 class App:
@@ -184,7 +206,7 @@ class App:
         self.tile_w = int(150 * self.sf)
         self.tile_h = int(222 * self.sf)
         self.thumb_box = int(128 * self.sf)
-        self.gap = int(10 * self.sf)
+        self.gap = int(34 * self.sf)
 
         root.title(APP_TITLE)
         root.geometry(f"{int(860 * self.sf)}x{int(720 * self.sf)}")
@@ -204,14 +226,10 @@ class App:
         # ── 設定 ──
         f_opt = ttk.LabelFrame(root, text="設定")
         f_opt.pack(fill="x", **pad)
-        self.pair_var = tk.BooleanVar(value=self.cfg["pair"])
         self.rot_var = tk.BooleanVar(value=self.cfg["auto_rotate"])
         self.shadow_var = tk.BooleanVar(value=self.cfg["shadow"])
         self.keepbg_var = tk.BooleanVar(value=self.cfg["keep_bg"])
-        r1 = ttk.Frame(f_opt); r1.pack(fill="x", padx=6, pady=(4, 0))
-        ttk.Checkbutton(r1, text="表・裏の2枚を横に並べて1枚にする（一覧の1枚目＋2枚目、3枚目＋4枚目…）",
-                        variable=self.pair_var, command=self.on_option).pack(side="left")
-        r2 = ttk.Frame(f_opt); r2.pack(fill="x", padx=6, pady=2)
+        r2 = ttk.Frame(f_opt); r2.pack(fill="x", padx=6, pady=(4, 2))
         ttk.Checkbutton(r2, text="向きを自動で直す（トップス・パンツ・スカート）", variable=self.rot_var,
                         command=self.on_auto_rotate).pack(side="left")
         ttk.Checkbutton(r2, text="うっすら影", variable=self.shadow_var,
@@ -236,12 +254,14 @@ class App:
         self.margin_lbl.pack(side="left")
 
         # ── 写真一覧 ──
-        f_list = ttk.LabelFrame(root, text="写真（ドラッグで並び替え ／ ⟲⟳で回転 ／ ✕で外す）")
+        f_list = ttk.LabelFrame(root, text="写真（ドラッグで並び替え ／ ⟲⟳で回転 ／ ✕で外す ／ 写真の間の丸ボタンで表・裏ペア）")
         f_list.pack(fill="both", expand=True, **pad)
         bar = ttk.Frame(f_list); bar.pack(fill="x", padx=6, pady=(4, 2))
         ttk.Button(bar, text="写真を追加…", command=self.pick_files).pack(side="left")
         ttk.Button(bar, text="フォルダを追加…", command=self.pick_folder).pack(side="left", padx=4)
         ttk.Button(bar, text="すべて外す", command=self.clear_items).pack(side="left", padx=4)
+        ttk.Button(bar, text="2枚ずつペアにする", command=lambda: self.set_all_links(True)).pack(side="left", padx=(16, 4))
+        ttk.Button(bar, text="ペアを全部解除", command=lambda: self.set_all_links(False)).pack(side="left")
         self.count_lbl = ttk.Label(bar, text="")
         self.count_lbl.pack(side="right")
 
@@ -296,7 +316,7 @@ class App:
             margin = round(float(self.margin_var.get()))
         except Exception:
             margin = 6
-        self.cfg.update(output_dir=self.out_var.get(), pair=self.pair_var.get(), auto_rotate=self.rot_var.get(),
+        self.cfg.update(output_dir=self.out_var.get(), auto_rotate=self.rot_var.get(),
                         shadow=self.shadow_var.get(), keep_bg=self.keepbg_var.get(), size=self.size_var.get(),
                         model=self.model_var.get(), margin=margin)
         save_config(self.cfg)
@@ -347,6 +367,29 @@ class App:
             self.analyze_q.put(it)
         self.redraw()
         self.update_status()
+
+    def set_all_links(self, on: bool):
+        if self.processing:
+            return
+        for i, it in enumerate(self.items):
+            it.link_next = on and i % 2 == 0
+        normalize_links(self.items)
+        self.redraw()
+
+    def toggle_link(self, it: Item):
+        i = self.items.index(it)
+        if i + 1 >= len(self.items):
+            return
+        if it.link_next:
+            it.link_next = False
+        else:
+            # つなぐ2枚が、ほかのペアに入っていたら外す
+            if i > 0:
+                self.items[i - 1].link_next = False
+            self.items[i + 1].link_next = False
+            it.link_next = True
+        normalize_links(self.items)
+        self.redraw()
 
     def clear_items(self):
         if self.processing:
@@ -409,15 +452,34 @@ class App:
             self.update_count()
             return
         cols = self.layout()
-        pair = self.pair_var.get()
         n = len(self.items)
+        role = {}
+        for k, g in enumerate(make_groups(self.items)):
+            if len(g) == 2:
+                role[g[0].id] = (k, "表")
+                role[g[1].id] = (k, "裏")
+        pair_no = {}
+        for it in self.items:
+            if it.id in role and role[it.id][1] == "表":
+                pair_no[role[it.id][0]] = len(pair_no) + 1
+        # ペアの2枚を帯でつなぐ（同じ行にあるとき）
+        for i, it in enumerate(self.items[:-1]):
+            if it.link_next:
+                x1, y1 = self.tile_xy(i, cols)
+                x2, y2 = self.tile_xy(i + 1, cols)
+                if y1 == y2:
+                    bg = PAIR_COLORS[(pair_no[role[it.id][0]] - 1) % 2]
+                    cv.create_rectangle(x1 + self.tile_w - 2, y1 + self.tile_h * 0.25, x2 + 2,
+                                        y1 + self.tile_h * 0.75, fill=bg, outline="")
         for i, it in enumerate(self.items):
             x, y = self.tile_xy(i, cols)
             tag = f"t{it.id}"
             tags = ("tile", tag)
-            if pair and not (i == n - 1 and n % 2 == 1):
-                bg = PAIR_COLORS[(i // 2) % 2]
-                label = f"{i + 1}  ペア{i // 2 + 1}・{'表' if i % 2 == 0 else '裏'}"
+            if it.id in role:
+                k, side = role[it.id]
+                no = pair_no[k]
+                bg = PAIR_COLORS[(no - 1) % 2]
+                label = f"{i + 1}  ペア{no}・{side}"
             else:
                 bg = "#f2f2f2"
                 label = f"{i + 1}"
@@ -453,18 +515,43 @@ class App:
                                       ("✕", "del", x + self.tile_w - 18 * self.sf, "#c33")):
                 cv.create_text(bx, by, text=sym, fill=col, font=(self.fam, self.fsize + 6, "bold"),
                                tags=("btn", act, tag))
+        # 写真と写真の間の「つなぐ」ボタン
+        for i, it in enumerate(self.items[:-1]):
+            x, y = self.tile_xy(i, cols)
+            self.draw_link_button(x + self.tile_w + self.gap / 2, y + self.tile_h / 2, it)
         rows = (n + cols - 1) // cols
         cv.configure(scrollregion=(0, 0, cv.winfo_width(), self.gap + rows * (self.tile_h + self.gap)))
         self.update_count()
+
+    def draw_link_button(self, cx, cy, it: Item):
+        """鎖のマークの丸ボタン（つながっている＝青、つながっていない＝グレー）"""
+        cv, r = self.canvas, 13 * self.sf
+        on = it.link_next
+        tags = ("btn", "link", f"l{it.id}")
+        cv.create_oval(cx - r, cy - r, cx + r, cy + r, fill=ACCENT if on else "white",
+                       outline=ACCENT if on else "#aaa", width=max(1, int(1.5 * self.sf)), tags=tags)
+        fg, bg = ("white", ACCENT) if on else ("#8a8a8a", "white")
+        u = self.sf
+        # 斜めの2つの輪（鎖のマーク）：太線の上に背景色の細線を重ねて中抜きにする
+        for (x1, y1, x2, y2) in ((-6.5, 6.5, -1.5, 1.5), (1.5, -1.5, 6.5, -6.5)):
+            cv.create_line(cx + x1 * u, cy + y1 * u, cx + x2 * u, cy + y2 * u, fill=fg,
+                           width=7 * u, capstyle="round", tags=tags)
+            cv.create_line(cx + x1 * u, cy + y1 * u, cx + x2 * u, cy + y2 * u, fill=bg,
+                           width=3 * u, capstyle="round", tags=tags)
+        cv.create_line(cx - 2.5 * u, cy + 2.5 * u, cx + 2.5 * u, cy - 2.5 * u, fill=fg,
+                       width=2 * u, capstyle="round", tags=tags)
+        if not on:  # つながっていない＝斜線で切る
+            cv.create_line(cx - 7 * u, cy - 7 * u, cx + 7 * u, cy + 7 * u, fill="white", width=4 * u, tags=tags)
+            cv.create_line(cx - 7 * u, cy - 7 * u, cx + 7 * u, cy + 7 * u, fill="#8a8a8a", width=1.5 * u, tags=tags)
 
     def update_count(self):
         n = len(self.items)
         if not n:
             self.count_lbl.config(text="")
-        elif self.pair_var.get():
-            self.count_lbl.config(text=f"{n}枚 → 出来上がり {(n + 1) // 2}枚")
-        else:
-            self.count_lbl.config(text=f"{n}枚")
+            return
+        groups = make_groups(self.items)
+        pairs = sum(1 for g in groups if len(g) == 2)
+        self.count_lbl.config(text=f"{n}枚（ペア{pairs}組） → 出来上がり {len(groups)}枚" if pairs else f"{n}枚")
 
     def update_status(self):
         if self.processing:
@@ -502,12 +589,22 @@ class App:
         if not cur:
             return
         tags = self.canvas.gettags(cur[0])
+        if "link" in tags:
+            lid = next(int(t[1:]) for t in tags if t.startswith("l") and t[1:].isdigit())
+            it = next((x for x in self.items if x.id == lid), None)
+            if it is not None:
+                self.toggle_link(it)
+            return
         it = self.item_by_tag(tags)
         if it is None:
             return
         if "btn" in tags:
             if "del" in tags:
+                i = self.items.index(it)
+                if i > 0:
+                    self.items[i - 1].link_next = False
                 self.items.remove(it)
+                normalize_links(self.items)
             elif "rotL" in tags:
                 it.rotation = (it.rotation - 90) % 360
             elif "rotR" in tags:
@@ -562,10 +659,20 @@ class App:
         it = d["item"]
         old = self.items.index(it)
         new = d["target"]
+        if new in (old, old + 1):
+            self.redraw()
+            return
+        # 動かした写真のペアは解除する
+        if old > 0:
+            self.items[old - 1].link_next = False
+        it.link_next = False
         self.items.pop(old)
         if new > old:
             new -= 1
         self.items.insert(new, it)
+        if new > 0:  # 割り込んだ先のペアも解除
+            self.items[new - 1].link_next = False
+        normalize_links(self.items)
         self.redraw()
 
     def on_wheel(self, e):
@@ -586,24 +693,21 @@ class App:
             return
         self.store_config()
         args = Namespace(size=size, ratio="1:1", margin=round(float(self.margin_var.get())) / 100, quality=92,
-                         keep_bg=self.keepbg_var.get(), shadow=self.shadow_var.get(), pair=self.pair_var.get(),
+                         keep_bg=self.keepbg_var.get(), shadow=self.shadow_var.get(), pair=False,
                          gap=0.04, no_refine=False, model=MODELS[self.model_var.get()])
-        items = [it for it in self.items if it.state == "ready"]
+        normalize_links(self.items)
+        groups = [g for g in make_groups(self.items) if all(it.state == "ready" for it in g)]
         out_dir = Path(self.out_var.get())
         self.processing = True
         self.run_btn.config(state="disabled")
-        threading.Thread(target=self.process_worker, args=(items, out_dir, args), daemon=True).start()
+        threading.Thread(target=self.process_worker, args=(groups, out_dir, args), daemon=True).start()
 
-    def process_worker(self, items, out_dir: Path, args):
+    def process_worker(self, groups, out_dir: Path, args):
         q = self.ui_q
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
             session = None if args.keep_bg else self.get_session(args.model)
             reuse = args.model == ANALYZE_MODEL  # 下調べのAI結果を使い回せる
-            groups = []
-            step = 2 if args.pair else 1
-            for i in range(0, len(items), step):
-                groups.append(items[i:i + step])
             q.put(("total", len(groups)))
             ok = ng = 0
             for n, g in enumerate(groups, 1):
